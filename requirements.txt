@@ -10,3 +10,4 @@ sentence-transformers
 torch
 numpy
 PyMuPDF
+faiss-cpu==1.8.0.post1
