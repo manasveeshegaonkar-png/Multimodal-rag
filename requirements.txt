@@ -2,3 +2,4 @@ sentence-transformers
 uvicorn[standard]
 fastapi
 PyMuPDF
+faiss-cpu
