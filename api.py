@@ -5,8 +5,7 @@ from pydantic import BaseModel
 import pymupdf
 import os
 
-from app.ingestion.vision.indexing.retrieval.retriever import retrieve
-from app.ingestion.vision.indexing.retrieval.generation.generator import generate_answer
+
 
 
 # =========================================================
@@ -74,6 +73,9 @@ def root():
 
 @app.post("/ask")
 def ask_pdf(request: QuestionRequest):
+           
+    from app.ingestion.vision.indexing.retrieval.retriever import retrieve
+    from app.ingestion.vision.indexing.retrieval.generation.generator import generate_answer
 
     question = request.query.strip()
 
