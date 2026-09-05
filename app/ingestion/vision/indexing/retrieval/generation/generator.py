@@ -1,7 +1,7 @@
-import requests
+import os
+from google import genai
 
-OLLAMA_URL = "http://localhost:11434/api/generate"
-MODEL = "llama3.2:3b"
+MODEL = "gemini-3.6-flash"
 
 
 def generate_answer(query, context):
@@ -31,7 +31,7 @@ IMPORTANT RULES:
    include the relevant information.
 10. Do not mention that you are using a context or retrieval system.
 11. If the answer genuinely cannot be found in the provided context, say:
-   "I could not find the answer in the provided book."
+    "I could not find the answer in the provided book."
 
 Retrieved context:
 -------------------------
@@ -44,24 +44,16 @@ User question:
 Detailed answer:
 """
 
-    payload = {
-        "model": MODEL,
-        "prompt": prompt,
-        "stream": False,
-        "options": {
-            "temperature": 0.2,
-            "num_predict": 800
-        }
-    }
+    api_key = os.getenv("GEMINI_API_KEY")
 
-    response = requests.post(
-        OLLAMA_URL,
-        json=payload,
-        timeout=120
+    if not api_key:
+        raise RuntimeError("GEMINI_API_KEY is not set")
+
+    client = genai.Client(api_key=api_key)
+
+    response = client.models.generate_content(
+        model=MODEL,
+        contents=prompt
     )
 
-    response.raise_for_status()
-
-    data = response.json()
-
-    return data["response"].strip()
+    return response.text.strip()
