@@ -4,3 +4,5 @@ __pycache__/
 .vscode/
 backup_working_version/
 .env
+data/raw/uploads/
+*_backup.py
