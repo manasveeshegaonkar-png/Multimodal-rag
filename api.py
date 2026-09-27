@@ -1,7 +1,6 @@
 import os
 import re
 import uuid
-import shutil
 from pathlib import Path
 from typing import Any
 
@@ -15,51 +14,85 @@ from fastapi.responses import FileResponse, Response
 from pydantic import BaseModel
 
 from dotenv import load_dotenv
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
 from google import genai
 
 
-# ============================================================
-# ENVIRONMENT
-# ============================================================
-
 load_dotenv()
 
+
+# ============================================================
+# PATHS
+# ============================================================
+
 BASE_DIR = Path(__file__).resolve().parent
+
 FRONTEND_DIR = BASE_DIR / "frontend"
-UPLOAD_DIR = BASE_DIR / "data" / "raw" / "uploads"
 
-UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+UPLOAD_DIR = (
+    BASE_DIR
+    / "data"
+    / "raw"
+    / "uploads"
+)
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+UPLOAD_DIR.mkdir(
+    parents=True,
+    exist_ok=True
+)
+
+
+# ============================================================
+# ENVIRONMENT / CONFIGURATION
+# ============================================================
+
+GEMINI_API_KEY = os.getenv(
+    "GEMINI_API_KEY"
+)
 
 if not GEMINI_API_KEY:
     print(
         "\nWARNING: GEMINI_API_KEY is not configured."
         "\nThe application will start, but AI answers will not work"
-        " until the API key is added.\n"
+        "\nuntil the API key is added.\n"
     )
+
 
 GEMINI_MODEL = os.getenv(
     "GEMINI_MODEL",
-    "gemini-2.5-flash"
+    "gemini-3.8-flash"
 )
+
 
 EMBEDDING_MODEL_NAME = os.getenv(
     "EMBEDDING_MODEL",
     "sentence-transformers/all-MiniLM-L6-v2"
 )
 
+
 MAX_UPLOAD_SIZE_MB = int(
-    os.getenv("MAX_UPLOAD_SIZE_MB", "50")
+    os.getenv(
+        "MAX_UPLOAD_SIZE_MB",
+        "50"
+    )
 )
+
 
 MAX_UPLOAD_SIZE_BYTES = (
-    MAX_UPLOAD_SIZE_MB * 1024 * 1024
+    MAX_UPLOAD_SIZE_MB
+    * 1024
+    * 1024
 )
 
+
+# ============================================================
+# RAG CONFIGURATION
+# ============================================================
+
 CHUNK_SIZE = 350
+
 CHUNK_OVERLAP = 70
+
 TOP_K = 6
 
 
@@ -76,10 +109,6 @@ app = FastAPI(
     version="2.0.0"
 )
 
-
-# ============================================================
-# CORS
-# ============================================================
 
 app.add_middleware(
     CORSMiddleware,
@@ -103,7 +132,7 @@ if GEMINI_API_KEY:
 
 
 # ============================================================
-# EMBEDDING MODEL
+# FASTEMBED MODEL
 # ============================================================
 
 embedding_model = None
@@ -111,55 +140,145 @@ embedding_model = None
 
 def get_embedding_model():
     """
-    Load the sentence-transformer model only when required.
+    Load the lightweight FastEmbed model lazily.
 
-    This avoids downloading/loading the model when the API
-    is merely started.
+    The model is loaded only when an embedding is actually needed.
+    This helps reduce memory usage on low-memory deployments.
     """
 
     global embedding_model
 
     if embedding_model is None:
+
         print(
-            "\nLoading embedding model:",
+            "\nLoading lightweight embedding model:"
+        )
+
+        print(
             EMBEDDING_MODEL_NAME
         )
 
-        embedding_model = SentenceTransformer(
-            EMBEDDING_MODEL_NAME
+        embedding_model = TextEmbedding(
+            model_name=EMBEDDING_MODEL_NAME,
+            lazy_load=True
         )
 
-        print("Embedding model loaded.")
+        print(
+            "Lightweight embedding model initialized."
+        )
 
     return embedding_model
 
 
 # ============================================================
-# IN-MEMORY DOCUMENT STORE
+# DOCUMENT EMBEDDINGS
 # ============================================================
 
-documents: dict[str, dict[str, Any]] = {}
+def embed_documents(
+    texts: list[str]
+) -> np.ndarray:
+
+    if not texts:
+        return np.empty(
+            (0, 384),
+            dtype="float32"
+        )
+
+    model = get_embedding_model()
+
+    vectors = list(
+        model.embed(
+            texts,
+            batch_size=8
+        )
+    )
+
+    embeddings = np.asarray(
+        vectors,
+        dtype="float32"
+    )
+
+    if embeddings.size == 0:
+        return np.empty(
+            (0, 384),
+            dtype="float32"
+        )
+
+    faiss.normalize_L2(
+        embeddings
+    )
+
+    return embeddings
+
+
+# ============================================================
+# QUERY EMBEDDING
+# ============================================================
+
+def embed_query(
+    question: str
+) -> np.ndarray:
+
+    model = get_embedding_model()
+
+    vectors = list(
+        model.query_embed(
+            [question]
+        )
+    )
+
+    query_embedding = np.asarray(
+        vectors,
+        dtype="float32"
+    )
+
+    if query_embedding.size == 0:
+        return np.empty(
+            (0, 384),
+            dtype="float32"
+        )
+
+    faiss.normalize_L2(
+        query_embedding
+    )
+
+    return query_embedding
+
+
+# ============================================================
+# IN-MEMORY DOCUMENT STORAGE
+# ============================================================
+
+documents: dict[
+    str,
+    dict[str, Any]
+] = {}
 
 
 # ============================================================
 # REQUEST MODEL
 # ============================================================
 
-class QuestionRequest(BaseModel):
+class QuestionRequest(
+    BaseModel
+):
+
     query: str
+
     document_id: str
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# SAFE FILE NAME
 # ============================================================
 
-def safe_filename(filename: str) -> str:
-    """
-    Remove unsafe path characters from an uploaded filename.
-    """
+def safe_filename(
+    filename: str
+) -> str:
 
-    filename = Path(filename).name
+    filename = Path(
+        filename
+    ).name
 
     filename = re.sub(
         r"[^A-Za-z0-9._-]",
@@ -167,28 +286,32 @@ def safe_filename(filename: str) -> str:
         filename
     )
 
-    if not filename.lower().endswith(".pdf"):
+    if not filename.lower().endswith(
+        ".pdf"
+    ):
         filename += ".pdf"
 
     return filename
 
 
+# ============================================================
+# DOCUMENT ID
+# ============================================================
+
 def create_document_id() -> str:
-    """
-    Generate a collision-resistant document ID.
-    """
 
     return uuid.uuid4().hex
 
+
+# ============================================================
+# TEXT CHUNKING
+# ============================================================
 
 def split_text(
     text: str,
     chunk_size: int = CHUNK_SIZE,
     overlap: int = CHUNK_OVERLAP
 ) -> list[str]:
-    """
-    Split page text into overlapping word-based chunks.
-    """
 
     words = text.split()
 
@@ -209,12 +332,17 @@ def split_text(
             len(words)
         )
 
-        chunk = " ".join(
-            words[start:end]
-        ).strip()
+        chunk = (
+            " ".join(
+                words[start:end]
+            )
+            .strip()
+        )
 
         if chunk:
-            chunks.append(chunk)
+            chunks.append(
+                chunk
+            )
 
         if end >= len(words):
             break
@@ -224,38 +352,28 @@ def split_text(
     return chunks
 
 
+# ============================================================
+# BUILD FAISS INDEX
+# ============================================================
+
 def build_faiss_index(
     chunks: list[dict[str, Any]]
 ):
-    """
-    Create normalized sentence embeddings and a FAISS
-    inner-product index.
-
-    Because vectors are normalized, inner product behaves
-    as cosine similarity.
-    """
 
     if not chunks:
         return None
-
-    model = get_embedding_model()
 
     texts = [
         chunk["text"]
         for chunk in chunks
     ]
 
-    embeddings = model.encode(
-        texts,
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False
+    embeddings = embed_documents(
+        texts
     )
 
-    embeddings = np.asarray(
-        embeddings,
-        dtype="float32"
-    )
+    if embeddings.size == 0:
+        return None
 
     dimension = embeddings.shape[1]
 
@@ -263,40 +381,43 @@ def build_faiss_index(
         dimension
     )
 
-    index.add(embeddings)
+    index.add(
+        embeddings
+    )
+
+    del embeddings
 
     return index
 
+
+# ============================================================
+# RETRIEVE RELEVANT CHUNKS
+# ============================================================
 
 def retrieve_chunks(
     document: dict[str, Any],
     question: str,
     top_k: int = TOP_K
 ) -> list[dict[str, Any]]:
-    """
-    Perform semantic retrieval against the document's
-    FAISS index.
-    """
 
-    index = document.get("index")
-    chunks = document.get("chunks", [])
+    index = document.get(
+        "index"
+    )
+
+    chunks = document.get(
+        "chunks",
+        []
+    )
 
     if index is None or not chunks:
         return []
 
-    model = get_embedding_model()
-
-    query_embedding = model.encode(
-        [question],
-        convert_to_numpy=True,
-        normalize_embeddings=True,
-        show_progress_bar=False
+    query_embedding = embed_query(
+        question
     )
 
-    query_embedding = np.asarray(
-        query_embedding,
-        dtype="float32"
-    )
+    if query_embedding.size == 0:
+        return []
 
     k = min(
         top_k,
@@ -307,6 +428,8 @@ def retrieve_chunks(
         query_embedding,
         k
     )
+
+    del query_embedding
 
     results = []
 
@@ -321,24 +444,33 @@ def retrieve_chunks(
         if index_position >= len(chunks):
             continue
 
-        chunk = chunks[index_position].copy()
+        chunk = chunks[
+            index_position
+        ].copy()
 
-        chunk["score"] = float(score)
+        chunk["score"] = float(
+            score
+        )
 
-        results.append(chunk)
+        results.append(
+            chunk
+        )
 
     return results
 
+
+# ============================================================
+# RENDER PDF PAGE
+# ============================================================
 
 def render_page(
     pdf_path: str,
     page_number: int
 ) -> bytes:
-    """
-    Render a specific PDF page as PNG bytes.
-    """
 
-    document = pymupdf.open(pdf_path)
+    document = pymupdf.open(
+        pdf_path
+    )
 
     try:
 
@@ -364,20 +496,23 @@ def render_page(
             alpha=False
         )
 
-        return pixmap.tobytes("png")
+        return pixmap.tobytes(
+            "png"
+        )
 
     finally:
+
         document.close()
 
+
+# ============================================================
+# RAG PROMPT
+# ============================================================
 
 def build_rag_prompt(
     question: str,
     retrieved_chunks: list[dict[str, Any]]
 ) -> str:
-    """
-    Build the grounded prompt supplied alongside the
-    original PDF.
-    """
 
     context_blocks = []
 
@@ -387,62 +522,461 @@ def build_rag_prompt(
             "\n".join(
                 [
                     (
-                        f"[RETRIEVED SOURCE | "
-                        f"PAGE {result['page']} | "
-                        f"CHUNK {result['chunk_id']}]"
+                        f"[SOURCE PAGE {result['page']} | "
+                        f"CHUNK {result['chunk_id']} | "
+                        f"RELEVANCE {result['score']:.4f}]"
                     ),
                     result["text"]
                 ]
             )
         )
 
-    retrieved_context = "\n\n".join(
-        context_blocks
+    retrieved_context = (
+        "\n\n".join(
+            context_blocks
+        )
     )
 
+    if not retrieved_context:
+
+        retrieved_context = (
+            "[No sufficiently relevant text chunks were retrieved.]"
+        )
+
+
     prompt = f"""
-You are the AI assistant inside a multimodal PDF
-question-answering application.
+You are the AI assistant inside an application called PDF Insights.
 
-The user uploaded a PDF.
+Your job is to answer the user's question using the uploaded PDF.
 
-You have access to:
-1. The original PDF, including its text, tables,
-   figures, diagrams and page visuals.
-2. Semantically retrieved text chunks from that PDF.
+The original PDF is available to you. It may contain:
 
-Your job is to answer the user's question using ONLY
-information supported by the uploaded PDF.
+- normal text
+- tables
+- charts
+- figures
+- diagrams
+- images
+- formulas
+- examples
+
+You also receive semantically retrieved text from the PDF.
 
 USER QUESTION:
 {question}
 
-SEMANTICALLY RETRIEVED CONTEXT:
+
+RETRIEVED INFORMATION:
 {retrieved_context}
 
-IMPORTANT RULES:
 
-- Answer only from the uploaded PDF.
-- Do not use outside knowledge to fill missing information.
-- If the PDF does not contain enough information, clearly say:
-  "I could not find enough information in the provided PDF."
-- Do not invent facts, numbers, citations or page references.
-- You may use the original PDF to inspect tables, figures,
-  diagrams and other visual information when necessary.
-- When explaining an answer, mention the relevant page
-  numbers naturally, for example "According to page 12..."
-- Keep the answer clear and useful.
-- Prefer concise explanations unless the question requires
-  detail.
-- If the user asks for a comparison, use a structured
-  comparison.
-- If the user asks for a definition, explain it simply.
-- If the user asks about a table, chart, diagram or figure,
-  inspect the corresponding visual information in the PDF.
+============================================================
+1. MAIN GOAL
+============================================================
+
+Give the user a clear, natural and easy-to-understand answer.
+
+Your answer should feel like a helpful ChatGPT response from a
+knowledgeable person explaining something to a student.
+
+Do NOT sound like:
+
+- a textbook
+- a research paper
+- an academic report
+- technical documentation
+- a PDF summary
+- a search-result extraction
+- a collection of copied facts
+
+
+============================================================
+2. ANSWER THE QUESTION FIRST
+============================================================
+
+Start directly with the answer.
+
+Do NOT unnecessarily start with phrases such as:
+
+"According to the provided context..."
+
+"Based on the retrieved information..."
+
+"The document states..."
+
+"The PDF discusses..."
+
+"The text says..."
+
+Only mention the PDF when doing so is genuinely useful.
+
+
+============================================================
+3. USE SIMPLE, NATURAL ENGLISH
+============================================================
+
+Use language that a college student can easily understand.
+
+For example, prefer:
+
+"An input vector is simply a collection of values that represents
+one data sample and is given to a machine learning model as input."
+
+Avoid overly academic wording such as:
+
+"An input vector constitutes an n-dimensional representation of the
+features supplied to a machine-learning function."
+
+Explain the idea instead of trying to reproduce the writing style
+of the PDF.
+
+
+============================================================
+4. VERY IMPORTANT: PLAIN TEXT FORMATTING
+============================================================
+
+For normal questions, answer using plain readable text.
+
+DO NOT use:
+
+- LaTeX
+- mathematical notation
+- special mathematical symbols
+- unnecessary Unicode mathematical symbols
+- symbolic variable notation
+- equation formatting
+- "$...$"
+- "\\(...\\)"
+- "\\[...\\]"
+- expressions such as x₁, x₂, xₙ
+- expressions such as X = (...)
+- unnecessary arrows or symbolic representations
+
+unless the user explicitly asks for a formula, equation,
+mathematical notation, or the exact representation from the PDF.
+
+
+For example, DO NOT write:
+
+"An input vector is represented as X = (x₁, x₂, ..., xₙ)."
+
+Instead write:
+
+"An input vector is a collection of values representing the
+features of one data sample."
+
+
+The PDF may contain mathematical notation.
+
+You should UNDERSTAND that notation when necessary, but do NOT
+automatically reproduce it in your answer.
+
+Understanding the PDF's notation does NOT mean copying that notation
+into the response.
+
+
+============================================================
+5. WHEN SYMBOLS ARE ACTUALLY NECESSARY
+============================================================
+
+Only use mathematical notation when:
+
+1. The user explicitly asks for it, OR
+2. It is essential for answering the question and cannot reasonably
+   be explained in words.
+
+If notation is necessary, first explain the concept in normal words.
+
+For example:
+
+"An input vector is a group of values representing the features of
+one sample. In mathematical notation, the PDF represents it as
+X = (...)."
+
+Only do this when the notation is relevant to the user's question.
+
+
+============================================================
+6. DO NOT COPY PDF FORMATTING
+============================================================
+
+The PDF may contain:
+
+- equations
+- numbered definitions
+- academic terminology
+- long lists
+- headings
+- symbolic notation
+- formal descriptions
+
+Do not reproduce these simply because they appear in the PDF.
+
+Understand the information and explain it naturally.
+
+
+============================================================
+7. KEEP SIMPLE QUESTIONS SIMPLE
+============================================================
+
+If the user asks a simple question, give a simple answer.
+
+For example, if the user asks:
+
+"What is an input vector?"
+
+A good answer would normally be:
+
+"An input vector is simply a collection of values that represents
+one data sample and is given to a machine learning model as input.
+
+Each value represents a feature of that sample. For example, a
+student could be represented using information such as age, subject,
+gender, and year of study.
+
+In simple terms, you can think of an input vector as the information
+about one example that the model uses to make a prediction."
+
+Do not turn this into a long academic explanation unless the user
+asks for more detail.
+
+
+============================================================
+8. SHORT PARAGRAPHS
+============================================================
+
+Prefer short paragraphs.
+
+Use bullets only when they genuinely improve readability.
+
+Do NOT automatically create sections such as:
+
+"Key Details from the Text"
+
+"Synonyms"
+
+"Components / Features"
+
+"Types of Values"
+
+"Important Points"
+
+"Summary"
+
+unless they are genuinely useful or the user asks for them.
+
+
+============================================================
+9. DO NOT REPEAT YOURSELF
+============================================================
+
+Explain each idea once.
+
+Do not give the same definition in several different forms.
+
+Do not repeat the user's question unnecessarily.
+
+Do not add a conclusion that simply repeats the answer.
+
+
+============================================================
+10. TECHNICAL TERMS
+============================================================
+
+Use technical terms when they are important.
+
+But explain them naturally when necessary.
+
+For example:
+
+"An embedding is a numerical representation of text that allows the
+system to compare the meaning of different pieces of text."
+
+Do not define every technical word automatically.
+
+
+============================================================
+11. EXAMPLES
+============================================================
+
+Use examples when they make the concept easier to understand.
+
+Keep examples simple.
+
+If the example is your own illustrative example rather than something
+directly stated in the PDF, make sure it is clear that it is only an
+example.
+
+Do not present your own example as something the PDF said.
+
+
+============================================================
+12. EQUATIONS
+============================================================
+
+Do not reproduce equations merely because the PDF contains them.
+
+Only include an equation if:
+
+- the user asks for it, or
+- the equation is essential to understanding the requested answer.
+
+For a normal conceptual question, explain the idea using words.
+
+
+============================================================
+13. PDF GROUNDING
+============================================================
+
+The uploaded PDF is the source of truth.
+
+Use information supported by the uploaded PDF.
+
+Do NOT invent:
+
+- facts
+- numbers
+- formulas
+- definitions
+- conclusions
+- citations
+- page numbers
+
+Do NOT use outside knowledge to fill important gaps.
+
+If the answer cannot be supported by the uploaded PDF, say:
+
+"I couldn't find enough information about this in the provided PDF."
+
+
+============================================================
+14. RETRIEVED CHUNKS
+============================================================
+
+The retrieved chunks are search results.
+
+They are NOT automatically the final answer.
+
+Some retrieved chunks may be only partially relevant.
+
+Use only the parts that actually help answer the question.
+
+The original PDF is also available for checking the surrounding
+context.
+
+If the retrieved chunks are insufficient but the answer may be
+available elsewhere in the PDF, use the original PDF before deciding
+that the information is unavailable.
+
+
+============================================================
+15. PAGE REFERENCES
+============================================================
+
+Mention page numbers naturally when useful.
+
+For example:
+
+"The PDF explains this on page 16."
+
+or:
+
+"This example appears on page 16."
+
+Do not invent page numbers.
+
+Only mention a page number when it can be supported by the PDF.
+
+
+============================================================
+16. VISUAL CONTENT
+============================================================
+
+The PDF may contain charts, tables, figures, diagrams and images.
+
+If the user's question is specifically about one of these, use the
+original PDF to understand the relevant content.
+
+Do not claim to have interpreted a visual if the available PDF
+information does not support that interpretation.
+
+
+============================================================
+17. DIFFERENT TYPES OF QUESTIONS
+============================================================
+
+For a definition question:
+
+Give the definition first and then a short explanation or example
+if useful.
+
+For a "how" question:
+
+Explain the process in clear steps.
+
+For a "why" question:
+
+Explain the reason directly.
+
+For a comparison:
+
+Explain the differences clearly.
+
+Use a table only when it genuinely makes the comparison easier.
+
+For a detailed question:
+
+Give enough detail to properly answer it, but keep the language
+natural and readable.
+
+
+============================================================
+18. LENGTH
+============================================================
+
+Match the answer length to the question.
+
+Simple question:
+Usually 1–3 short paragraphs.
+
+Moderately detailed question:
+A few short paragraphs or a small number of bullets.
+
+Complex question:
+Provide enough detail to properly answer it.
+
+Do not make the answer longer simply because more information exists
+in the PDF.
+
+
+============================================================
+19. FINAL QUALITY CHECK
+============================================================
+
+Before responding, check that the answer is:
+
+1. Correct
+2. Supported by the PDF
+3. Direct
+4. Easy to understand
+5. Natural
+6. Not repetitive
+7. Not unnecessarily academic
+8. Appropriately concise
+9. Written in plain English
+10. Free from unnecessary mathematical notation
+11. Free from unnecessary PDF-style formatting
+12. Not simply copying the wording or structure of the PDF
+
+Now answer the user's question.
 """
 
     return prompt
 
+
+# ============================================================
+# GENERATE ANSWER
+# ============================================================
 
 def generate_answer(
     pdf_path: str,
@@ -450,15 +984,9 @@ def generate_answer(
     retrieved_chunks: list[dict[str, Any]],
     gemini_file: Any
 ) -> str:
-    """
-    Generate a grounded multimodal answer using Gemini.
-
-    The original PDF is provided to Gemini so that the model
-    can understand visual content in addition to the retrieved
-    semantic text.
-    """
 
     if gemini_client is None:
+
         raise RuntimeError(
             "GEMINI_API_KEY is not configured."
         )
@@ -468,12 +996,16 @@ def generate_answer(
         retrieved_chunks
     )
 
-    response = gemini_client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=[
-            gemini_file,
-            prompt
-        ]
+    response = (
+        gemini_client
+        .models
+        .generate_content(
+            model=GEMINI_MODEL,
+            contents=[
+                gemini_file,
+                prompt
+            ]
+        )
     )
 
     answer = getattr(
@@ -483,6 +1015,7 @@ def generate_answer(
     )
 
     if not answer:
+
         raise RuntimeError(
             "Gemini returned an empty response."
         )
@@ -490,15 +1023,13 @@ def generate_answer(
     return answer.strip()
 
 
+# ============================================================
+# UPLOAD PDF TO GEMINI
+# ============================================================
+
 def upload_pdf_to_gemini(
     file_path: str
 ):
-    """
-    Upload the original PDF to Gemini Files API.
-
-    This allows Gemini to inspect the complete PDF,
-    including visual information.
-    """
 
     if gemini_client is None:
         return None
@@ -507,8 +1038,12 @@ def upload_pdf_to_gemini(
         "\nUploading PDF to Gemini Files API..."
     )
 
-    uploaded_file = gemini_client.files.upload(
-        file=file_path
+    uploaded_file = (
+        gemini_client
+        .files
+        .upload(
+            file=file_path
+        )
     )
 
     print(
@@ -524,23 +1059,25 @@ def upload_pdf_to_gemini(
 
 
 # ============================================================
-# ROUTES
+# ROOT
 # ============================================================
 
 @app.get("/")
 async def root():
-    """
-    Serve the actual application UI.
-    """
 
-    index_file = FRONTEND_DIR / "index.html"
+    index_file = (
+        FRONTEND_DIR
+        / "index.html"
+    )
 
     if not index_file.exists():
 
         return {
             "message": "PDF Insights API is running.",
             "status": "ok",
-            "frontend": "frontend/index.html not found"
+            "frontend": (
+                "frontend/index.html not found"
+            )
         }
 
     return FileResponse(
@@ -548,19 +1085,24 @@ async def root():
     )
 
 
+# ============================================================
+# HEALTH CHECK
+# ============================================================
+
 @app.get("/health")
 async def health():
-    """
-    Health check endpoint.
-    """
 
     return {
         "status": "healthy",
         "gemini_configured": (
             gemini_client is not None
         ),
+        "gemini_model": GEMINI_MODEL,
         "embedding_model": (
             EMBEDDING_MODEL_NAME
+        ),
+        "embedding_backend": (
+            "FastEmbed / ONNX Runtime"
         ),
         "documents_loaded": len(
             documents
@@ -568,33 +1110,17 @@ async def health():
     }
 
 
+# ============================================================
+# UPLOAD ENDPOINT
+# ============================================================
+
 @app.post("/upload")
 async def upload_pdf(
     file: UploadFile = File(...)
 ):
-    """
-    Upload and process a PDF.
-
-    Processing pipeline:
-
-    PDF
-      ↓
-    Save
-      ↓
-    PyMuPDF text extraction
-      ↓
-    Page-aware chunks
-      ↓
-    Sentence Transformer embeddings
-      ↓
-    FAISS index
-      ↓
-    Gemini multimodal PDF upload
-      ↓
-    Document ready for questions
-    """
 
     if not file.filename:
+
         raise HTTPException(
             status_code=400,
             detail="No filename was provided."
@@ -603,22 +1129,27 @@ async def upload_pdf(
     if not file.filename.lower().endswith(
         ".pdf"
     ):
+
         raise HTTPException(
             status_code=400,
             detail="Only PDF files are allowed."
         )
+
+    file_path = None
 
     try:
 
         contents = await file.read()
 
         if not contents:
+
             raise HTTPException(
                 status_code=400,
                 detail="The uploaded PDF is empty."
             )
 
         if len(contents) > MAX_UPLOAD_SIZE_BYTES:
+
             raise HTTPException(
                 status_code=413,
                 detail=(
@@ -634,12 +1165,13 @@ async def upload_pdf(
         )
 
         stored_filename = (
-            f"{document_id}_{original_filename}"
+            f"{document_id}_"
+            f"{original_filename}"
         )
 
         file_path = (
-            UPLOAD_DIR /
-            stored_filename
+            UPLOAD_DIR
+            / stored_filename
         )
 
         with open(
@@ -651,6 +1183,9 @@ async def upload_pdf(
                 contents
             )
 
+        del contents
+
+
         print(
             "\n" + "=" * 70
         )
@@ -660,9 +1195,6 @@ async def upload_pdf(
             original_filename
         )
 
-        # ----------------------------------------------------
-        # OPEN PDF
-        # ----------------------------------------------------
 
         document = pymupdf.open(
             str(file_path)
@@ -675,11 +1207,9 @@ async def upload_pdf(
         chunks = []
 
         pages_with_text = 0
+
         pages_with_images = 0
 
-        # ----------------------------------------------------
-        # PAGE-BY-PAGE PROCESSING
-        # ----------------------------------------------------
 
         for page_number, page in enumerate(
             document,
@@ -687,9 +1217,11 @@ async def upload_pdf(
         ):
 
             page_text = (
-                page.get_text(
+                page
+                .get_text(
                     "text"
-                ).strip()
+                )
+                .strip()
             )
 
             image_count = len(
@@ -699,6 +1231,7 @@ async def upload_pdf(
             )
 
             if image_count > 0:
+
                 pages_with_images += 1
 
             if page_text:
@@ -709,7 +1242,10 @@ async def upload_pdf(
                     page_text
                 )
 
-                for chunk_number, chunk_text in enumerate(
+                for (
+                    chunk_number,
+                    chunk_text
+                ) in enumerate(
                     page_chunks,
                     start=1
                 ):
@@ -726,7 +1262,9 @@ async def upload_pdf(
                         }
                     )
 
+
         document.close()
+
 
         print(
             "Pages:",
@@ -748,19 +1286,20 @@ async def upload_pdf(
             len(chunks)
         )
 
-        # ----------------------------------------------------
-        # FAISS INDEX
-        # ----------------------------------------------------
 
         index = build_faiss_index(
             chunks
         )
 
-        # ----------------------------------------------------
-        # GEMINI FILE
-        # ----------------------------------------------------
+
+        print(
+            "FAISS index created:",
+            index is not None
+        )
+
 
         gemini_file = None
+
 
         if gemini_client is not None:
 
@@ -776,24 +1315,34 @@ async def upload_pdf(
 
                 print(
                     "\nGemini upload warning:",
-                    repr(gemini_error)
+                    repr(
+                        gemini_error
+                    )
                 )
 
                 gemini_file = None
 
-        # ----------------------------------------------------
-        # STORE DOCUMENT
-        # ----------------------------------------------------
 
-        documents[document_id] = {
+        documents[
+            document_id
+        ] = {
+
             "document_id": document_id,
+
             "filename": original_filename,
+
             "path": str(file_path),
+
             "pages": page_count,
+
             "chunks": chunks,
+
             "index": index,
+
             "gemini_file": gemini_file
+
         }
+
 
         print(
             "Document ID:",
@@ -801,29 +1350,48 @@ async def upload_pdf(
         )
 
         print(
+            "Gemini multimodal file available:",
+            gemini_file is not None
+        )
+
+        print(
             "=" * 70
         )
 
+
         return {
+
             "message": (
                 "PDF uploaded and processed successfully."
             ),
+
             "document_id": document_id,
+
             "filename": original_filename,
+
             "pages": page_count,
+
             "chunks": len(chunks),
+
             "pages_with_text": pages_with_text,
+
             "pages_with_images": pages_with_images,
+
             "semantic_search": (
                 index is not None
             ),
+
             "multimodal_ai": (
                 gemini_file is not None
             )
+
         }
 
+
     except HTTPException:
+
         raise
+
 
     except Exception as error:
 
@@ -832,13 +1400,19 @@ async def upload_pdf(
             repr(error)
         )
 
-        if "file_path" in locals():
+
+        if file_path is not None:
 
             try:
+
                 if file_path.exists():
+
                     file_path.unlink()
+
             except Exception:
+
                 pass
+
 
         raise HTTPException(
             status_code=500,
@@ -849,41 +1423,35 @@ async def upload_pdf(
         )
 
 
+# ============================================================
+# ASK ENDPOINT
+# ============================================================
+
 @app.post("/ask")
 async def ask_pdf(
     request: QuestionRequest
 ):
-    """
-    Answer a question using:
-
-    Question
-       ↓
-    Sentence-transformer embedding
-       ↓
-    FAISS semantic retrieval
-       ↓
-    Relevant page-aware chunks
-       ↓
-    Original PDF to Gemini
-       ↓
-    Grounded multimodal answer
-    """
 
     question = (
         request.query or ""
     ).strip()
 
+
     if not question:
+
         raise HTTPException(
             status_code=400,
             detail="Question cannot be empty."
         )
 
+
     document = documents.get(
         request.document_id
     )
 
+
     if document is None:
+
         raise HTTPException(
             status_code=404,
             detail=(
@@ -892,7 +1460,9 @@ async def ask_pdf(
             )
         )
 
+
     if gemini_client is None:
+
         raise HTTPException(
             status_code=500,
             detail=(
@@ -900,6 +1470,7 @@ async def ask_pdf(
                 "Add it to the environment before asking questions."
             )
         )
+
 
     try:
 
@@ -912,9 +1483,6 @@ async def ask_pdf(
             question
         )
 
-        # ----------------------------------------------------
-        # SEMANTIC RETRIEVAL
-        # ----------------------------------------------------
 
         results = retrieve_chunks(
             document,
@@ -922,28 +1490,54 @@ async def ask_pdf(
             TOP_K
         )
 
+
         print(
             "Retrieved chunks:",
             len(results)
         )
 
-        # ----------------------------------------------------
-        # GENERATION
-        # ----------------------------------------------------
+
+        print(
+            "Retrieved pages:",
+            [
+                result["page"]
+                for result in results
+            ]
+        )
+
 
         gemini_file = document.get(
             "gemini_file"
         )
 
+
         if gemini_file is None:
 
-            gemini_file = upload_pdf_to_gemini(
-                document["path"]
+            print(
+                "Gemini PDF reference missing."
             )
 
-            document["gemini_file"] = (
-                gemini_file
+            print(
+                "Uploading PDF again..."
             )
+
+            gemini_file = (
+                upload_pdf_to_gemini(
+                    document["path"]
+                )
+            )
+
+            document[
+                "gemini_file"
+            ] = gemini_file
+
+
+        if gemini_file is None:
+
+            raise RuntimeError(
+                "The PDF could not be uploaded to Gemini."
+            )
+
 
         answer = generate_answer(
             document["path"],
@@ -952,13 +1546,11 @@ async def ask_pdf(
             gemini_file
         )
 
-        # ----------------------------------------------------
-        # SOURCE CREATION
-        # ----------------------------------------------------
 
         sources = []
 
         seen_pages = set()
+
 
         for result in results:
 
@@ -975,18 +1567,25 @@ async def ask_pdf(
                 {
                     "page": page,
                     "type": "text",
-                    "chunk_id": result[
-                        "chunk_id"
-                    ],
+                    "chunk_id": (
+                        result[
+                            "chunk_id"
+                        ]
+                    ),
                     "score": round(
-                        result["score"],
+                        result[
+                            "score"
+                        ],
                         4
                     ),
-                    "filename": document[
-                        "filename"
-                    ]
+                    "filename": (
+                        document[
+                            "filename"
+                        ]
+                    )
                 }
             )
+
 
         print(
             "Sources:",
@@ -1000,17 +1599,30 @@ async def ask_pdf(
             "=" * 70
         )
 
+
         return {
+
             "answer": answer,
+
             "sources": sources,
-            "document_id": request.document_id,
-            "filename": document[
-                "filename"
-            ]
+
+            "document_id": (
+                request.document_id
+            ),
+
+            "filename": (
+                document[
+                    "filename"
+                ]
+            )
+
         }
 
+
     except HTTPException:
+
         raise
+
 
     except Exception as error:
 
@@ -1028,6 +1640,10 @@ async def ask_pdf(
         )
 
 
+# ============================================================
+# SOURCE PAGE
+# ============================================================
+
 @app.get(
     "/source/{document_id}/{page}"
 )
@@ -1035,21 +1651,22 @@ async def get_pdf_page(
     document_id: str,
     page: int
 ):
-    """
-    Render a page from the exact PDF that the user uploaded.
-    """
 
     document = documents.get(
         document_id
     )
 
+
     if document is None:
+
         raise HTTPException(
             status_code=404,
             detail="Document not found."
         )
 
+
     if page < 1:
+
         raise HTTPException(
             status_code=400,
             detail=(
@@ -1057,7 +1674,11 @@ async def get_pdf_page(
             )
         )
 
-    if page > document["pages"]:
+
+    if page > document[
+        "pages"
+    ]:
+
         raise HTTPException(
             status_code=404,
             detail=(
@@ -1067,12 +1688,14 @@ async def get_pdf_page(
             )
         )
 
+
     try:
 
         image_bytes = render_page(
             document["path"],
             page
         )
+
 
         return Response(
             content=image_bytes,
@@ -1082,12 +1705,14 @@ async def get_pdf_page(
             }
         )
 
+
     except ValueError as error:
 
         raise HTTPException(
             status_code=404,
             detail=str(error)
         )
+
 
     except Exception as error:
 
@@ -1106,7 +1731,7 @@ async def get_pdf_page(
 
 
 # ============================================================
-# START LOCAL SERVER
+# LOCAL DEVELOPMENT
 # ============================================================
 
 if __name__ == "__main__":
